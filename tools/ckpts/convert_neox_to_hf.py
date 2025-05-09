@@ -105,6 +105,40 @@ MODEL_KEYS = {
                 "norm.bias": "bias",
             },
         },
+        ## TODO: Specify mapping dynamically based on TE modules enabled.
+        "transformer_engine": {
+            "COLUMN_PARALLEL_LINEAR_KEYS": {
+                "mlp.fc1_weight": "mlp.dense_h_to_4h.weight",
+                "mlp.fc1_bias": "mlp.dense_h_to_4h.bias",
+                "attention.qkv.weight": "attention.query_key_value.weight",
+                "attention.qkv.bias": "attention.query_key_value.bias",
+            },
+            "ROW_PARALLEL_LINEAR_KEYS": {
+                "attention.proj.weight": "attention.dense.weight",
+                "mlp.fc2_weight": "mlp.dense_4h_to_h.weight",
+            },
+            "ROW_PARALLEL_BIAS_KEYS": {
+                "mlp.fc2_bias": "mlp.dense_4h_to_h.bias",
+                "attention.proj.bias": "attention.dense.bias",
+            },
+            "NORM_KEYS": {
+                "input_layernorm.weight": "input_layernorm.weight",
+                "input_layernorm.bias": "input_layernorm.bias",
+                "mlp.layer_norm_weight": "post_attention_layernorm.weight",
+                "mlp.layer_norm_bias": "post_attention_layernorm.bias",
+            },
+            "FINAL_NORM_KEYS": {
+                "norm.weight": "weight",
+                "norm.bias": "bias",
+            },
+            # These keys are Transformer Engine specific and can be ignored
+            "IGNORE_KEYS": [
+                "attention.qkv._extra_state",
+                "attention.core_attention._extra_state",
+                "attention.proj._extra_state",
+                "mlp._extra_state",
+            ],
+        },
     },
     "llama": {
         "new": {
@@ -329,7 +363,7 @@ def create_config(neox_config, architecture="neox", is_rm=False, pad_token_id=-1
             {
                 "rotary_pct": get_key(neox_config, "rotary-pct", default=1.0),
                 "rotary_emb_base": get_key(
-                    neox_config, "rotary-emb-base", default=1000.0
+                    neox_config, "rotary-emb-base", default=10000.0
                 ),
                 "use_parallel_residual": get_key(neox_config, "gpt-j-residual", False),
                 "layer_norm_eps": get_key(neox_config, "layernorm-epsilon", 1e-5),
@@ -365,74 +399,40 @@ def reshard_and_split_qkv(
         ), "Must map QKV to precisely 3 resulting weight matrices."
 
     for key, hf_keys in param_mapping.items():
-        # we first merge the QKV proj. across TP ranks
-        sharded_qkv = torch.stack(
+        # We first merge the QKV proj. across TP ranks
+        tp_sharded_qkv = torch.stack(
             get_state(loaded_tp_ranks, key, layer_idx, sequential), dim=0
         )
-        # should now have shape [TP_SIZE, (hidden_size + 2 * kv_hidden_size) / TP_SIZE, hidden_size].
+        # We should now have shape [TP_SIZE, (hidden_size + 2 * kv_hidden_size) / TP_SIZE, hidden_size].
+        # At this point, for each TP rank, q, k, and v are concatenated
 
-        sharded_qkv = sharded_qkv.view(
-            len(loaded_tp_ranks),
-            hf_config.num_attention_heads // len(loaded_tp_ranks),
-            int(
-                hf_config.hidden_size
-                // hf_config.num_attention_heads
-                * (
-                    1
-                    + 2 * hf_config.num_key_value_heads / hf_config.num_attention_heads
-                )
-            ),
-            hf_config.hidden_size,
-        )  # is meant to convert to shape [TP_SIZE, NUM_QUERY_HEADS_PER_SHARD, dims_per_head * (1 + 2 * kv-to-q head ratio), hidden_size]
+        # Next, we split tp_harded_qkv into q, k, v along dim 1
+        hidden_size_per_attention_head = (
+            hf_config.hidden_size // hf_config.num_attention_heads
+        )
+        kv_hidden_size = int(
+            hidden_size_per_attention_head * hf_config.num_key_value_heads
+        )
+        tensor_parallel_size = len(loaded_tp_ranks)
 
         q, k, v = torch.split(
-            sharded_qkv,
+            tp_sharded_qkv,
             [
-                hf_config.hidden_size // hf_config.num_attention_heads,
-                int(
-                    (hf_config.num_key_value_heads / hf_config.num_attention_heads)
-                    * hf_config.hidden_size
-                    // hf_config.num_attention_heads
-                ),
-                int(
-                    (hf_config.num_key_value_heads / hf_config.num_attention_heads)
-                    * hf_config.hidden_size
-                    // hf_config.num_attention_heads
-                ),
+                hf_config.hidden_size // tensor_parallel_size,
+                kv_hidden_size // tensor_parallel_size,
+                kv_hidden_size // tensor_parallel_size,
             ],
-            dim=2,
-        )
-        # splits along the (dims_per_head * (1 + 2 * kv-to-q head ratio)_ dim to get 3 tensors:
-        # 1 x [TP_SIZE, NUM_Q_HEADS_PER_SHARD, dims_per_head, hidden_size] and 2 x [TP_SIZE, NUM_Q_HEADS_PER_SHARD, (dims_per_head / kv-to-q head ratio), hidden_size]
-        # these are the Q, and K, V tensors respectively.
+            dim=1,
+        )  # New shapes:
+        # q-->[TP_SIZE, hidden_size/TP_SIZE, hidden_size]
+        # k-->[TP_SIZE, kv_hidden_size/TP_SIZE, hidden_size]
+        # v-->[TP_SIZE, kv_hidden_size/TP_SIZE, hidden_size]
 
-        # we have to do additional reshape for each individual tensor now,
-        # into the expected square (or smaller than square, for K/V tensors) shape
-        q, k, v = q.squeeze(dim=2), k.squeeze(dim=2), v.squeeze(dim=2)
-        q = q.view(
-            hf_config.num_attention_heads,
-            hf_config.hidden_size // hf_config.num_attention_heads,
-            hf_config.hidden_size,
-        ).reshape(hf_config.hidden_size, hf_config.hidden_size)
-        k = k.reshape(
-            hf_config.num_key_value_heads,
-            hf_config.hidden_size // hf_config.num_attention_heads,
-            hf_config.hidden_size,
-        ).reshape(
-            hf_config.hidden_size
-            // hf_config.num_attention_heads
-            * hf_config.num_key_value_heads,
-            hf_config.hidden_size,
-        )
-        v = v.reshape(
-            hf_config.num_key_value_heads,
-            hf_config.hidden_size // hf_config.num_attention_heads,
-            hf_config.hidden_size,
-        ).reshape(
-            hf_config.hidden_size
-            // hf_config.num_attention_heads
-            * hf_config.num_key_value_heads,
-            hf_config.hidden_size,
+        # Finally, we flatten the first two dimensions merging the TP partitions
+        q, k, v = (
+            q.reshape(-1, q.shape[2]),
+            k.reshape(-1, k.shape[2]),
+            v.reshape(-1, k.shape[2]),
         )
 
         # return these
@@ -443,24 +443,21 @@ def reshard_and_split_qkv(
 
 
 def get_mlp_naming_convention(loaded_tp_ranks, layer_idx, sequential):
-    """Determine whether the checkpoint uses the legacy or new MLP naming convention."""
-    print(list(loaded_tp_ranks[0]["module"].keys()))
-    if any(
-        [
-            ["mlp.linear1.weight" in key for key in list(state_dict["module"].keys())]
-            for state_dict in loaded_tp_ranks
-        ]
-    ):
+    """Determine whether the checkpoint uses the legacy, new, or Transformer Engine naming convention."""
+    if sequential:
+        key_list = (
+            loaded_tp_ranks[0]["module"].keys()
+            if "module" in loaded_tp_ranks[0]
+            else loaded_tp_ranks[0].keys()
+        )
+    else:
+        key_list = loaded_tp_ranks[0].keys()
+
+    if any(["mlp.fc1_weight" in key for key in key_list]):
+        return "transformer_engine"
+    elif any(["mlp.linear1.weight" in key for key in key_list]):
         return "new"
-    elif any(
-        [
-            [
-                "mlp.dense_h_to_4h.weight" in key
-                for key in list(state_dict["module"].keys())
-            ]
-            for state_dict in loaded_tp_ranks
-        ]
-    ):
+    elif any(["mlp.dense_h_to_4h.weight" in key for key in key_list]):
         return "legacy"
     else:
         raise ValueError("Unable to determine MLP naming convention in checkpoint")
@@ -592,6 +589,20 @@ def convert(
                 layer_idx=layer_i + 2,
                 sequential=sequential,
             )
+
+        # Skip keys that should be ignored
+        if "IGNORE_KEYS" in ARCH:
+            # Just for logging purposes, check if the ignore keys exist
+            for key in ARCH["IGNORE_KEYS"]:
+                try:
+                    _ = get_state(
+                        loaded_tp_ranks,
+                        key,
+                        layer_idx=layer_i + 2,
+                        sequential=sequential,
+                    )
+                except Exception:
+                    pass
 
         # + 2 bc of embed layer and a dummy _pre_transformer_block
         state_dict = {}
